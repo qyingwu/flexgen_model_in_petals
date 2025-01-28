@@ -1,15 +1,9 @@
-<!-- <p align="center">
-    <img src="figures/bloombee.jpg" width="200"><br>
-    Run large language models decentralized.<br>
-</p>   -->
-
-<div style="display: flex; justify-content: center; align-items: center;">  
-    <img src="figures/bloombee.jpg" alt="Description of image" style="max-width: 100px; margin-right: 10px;"/>  
-    <h1 style="font-size: 4em; margin: 0;">BloomBee</h1>  
-</div>  
 <p align="center">
-Run large language models in a heterogeneous decentralized environment with offloading.<br>
+    <img src="figures/bloombee_log.png" width="200"><br>
+    Run large language models in a heterogeneous decentralized environment with offloading.<br>
 </p>  
+
+
 
 We depend on global GPU sharing. If your GPU can only handle a small part of the Llama3.1 (405B) model, you can join a network of servers to load different model parts.
 
