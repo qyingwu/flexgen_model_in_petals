@@ -1,6 +1,6 @@
-<p align="center">
-    <img src="figures/bloombee_log.png" width="200"><br>
-    Run large language models in a heterogeneous decentralized environment with offloading.<br>
+<p align="center">  
+    <img src="figures/bloombee_logo.png" alt="Bloombee Logo" /><br>  
+    Run large language models in a heterogeneous decentralized environment with offloading.<br>  
 </p>  
 
 
