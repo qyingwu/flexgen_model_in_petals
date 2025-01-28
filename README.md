@@ -4,9 +4,9 @@
 </p>   -->
 
 <div style="display: flex; justify-content: center; align-items: center;">  
-    <img src="figures/bloombee.jpg" alt="Description of image" style="max-width: 150px; margin-right: 10px;"/>  
-    <h1 style="font-size: 3em; margin: 0;">BloomBee</h1>  
-</div>
+    <img src="figures/bloombee.jpg" alt="Description of image" style="max-width: 100px; margin-right: 10px;"/>  
+    <h1 style="font-size: 4em; margin: 0;">BloomBee</h1>  
+</div>  
 <p align="center">
 Run large language models in a heterogeneous decentralized environment with offloading.<br>
 </p>  
