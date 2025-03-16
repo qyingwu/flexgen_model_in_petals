@@ -10,6 +10,7 @@ from typing import Tuple, Union, Optional, Any, Sequence, List
 
 import numpy as np
 import torch
+import sys
 
 
 KB = 1 << 10
@@ -160,30 +161,108 @@ def torch_mem_stats():
 
 
 class ValueHolder:
+    """Store a value."""
+
     def __init__(self):
-        self.val = None
-
-    def store(self, val):
-        # assert self.val is None #####
-        # self.val = val
-        if self.val is None: ####
-            self.val = val ######
-            print('valueholder store a val')
-        else : ####
-            self.val = val ######
-            print('valueholder update new val')
+        self.values = {}  # dict to store k-val pairs
+        self.store_counts = {}  # num of times each key is stored
+        self._val = None  # For backward compatibility
         
-
-    def pop(self):
-        ret = self.val
-        self.val = None
-        return ret
-
+    def store(self, key, val):
+        """Store a value."""
+        if isinstance(key, dict):
+            # Store a dictionary of values
+            for k, v in key.items():
+                self.store(k, v)
+            # for backward compatibility
+            self._val = val
+            return
+            
+        if key in self.values:
+            # Already stored
+            if id(self.values[key]) != id(val):
+                self.values[key] = val
+                self.store_counts[key] = self.store_counts.get(key, 0) + 1
+                print(f"ValueHolder: updated value for {key}")
+            else:
+                print(f"ValueHolder: same object for {key}, not updating")
+        else:
+            # Store a new value
+            self.values[key] = val
+            self.store_counts[key] = 1
+            print(f"ValueHolder: stored new value for {key}")
+        
+        # For backward compatibility - store most recent value directly
+        self._val = val
+        
+    def pop(self, key):
+        """Pop the value and reset to None."""
+        if key in self.values:
+            val = self.values[key]
+            self.store_counts[key] -= 1
+            
+            # Only remove from dictionary if no more references
+            if self.store_counts[key] <= 0:
+                del self.values[key]
+                del self.store_counts[key]
+                print(f"ValueHolder: removed {key} completely")
+            else:
+                print(f"ValueHolder: {key} still has {self.store_counts[key]} references")
+                
+            return val
+        else:
+            print(f"ValueHolder: key {key} not found")
+            return None
+    
     def clear(self):
-        self.val = None
-
+        """Clear all stored values."""
+        old_values = list(self.values.keys())
+        self.values.clear()
+        self.store_counts.clear()
+        self._val = None
+        print(f"ValueHolder: cleared all values: {old_values}")
+    
     def display(self):
-        return self.val
+        """Display the stored values."""
+        print(f"ValueHolder has {len(self.values)} items:")
+        for key, val in self.values.items():
+            print(f"  {key}: {type(val)} (references: {self.store_counts.get(key, 0)})")
+    
+    @property
+    def val(self):
+        """Get the stored value (for backward compatibility)."""
+        return self._val
+        
+    @property
+    def data(self):
+        """Get the stored value's data (for backward compatibility with from_pretrained.py)."""
+        if self._val is not None:
+            if hasattr(self._val, 'data'):
+                return self._val.data
+            # If _val doesn't have a data attribute, return _val itself
+            return self._val
+        # Return None if _val is None
+        return None
+            
+    def memory_usage(self):
+        """Estimate memory usage of stored values."""
+        total_bytes = 0
+        for key, val in self.values.items():
+            try:
+                if hasattr(val, 'element_size') and hasattr(val, 'nelement'):
+                    # For torch tensors
+                    bytes = val.element_size() * val.nelement()
+                elif hasattr(val, 'nbytes'):
+                    # For numpy arrays
+                    bytes = val.nbytes
+                else:
+                    # Rough estimate for other objects
+                    bytes = sys.getsizeof(val)
+                total_bytes += bytes
+                print(f"  {key}: {bytes / (1024 * 1024):.2f} MB")
+            except:
+                print(f"  {key}: size unknown")
+        return total_bytes
 
 
 def array_1d(a, cls):

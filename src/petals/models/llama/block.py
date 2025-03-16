@@ -30,8 +30,8 @@ from petals.flexgen_utils.compression import CompressionConfig
 from petals.flexgen_utils.policy import Policy
 from petals.flexgen_utils.pytorch_backend import fix_recursive_import, TorchTensor, TorchDevice
 from petals.flexgen_utils.utils import ValueHolder, array_1d, array_2d, array_3d
-from petals.models.llama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer
-from petals.models.llama.llama_config import get_llama_config
+from petals.models.llama.flex_llama import FLEX_LlamaAttention, FLEX_LlamaMLP, LlamaDecoderLayer, DUMMY_WEIGHT
+from petals.models.llama.llama_config import get_llama_config, download_llama_weights
 from petals.flexgen_utils.task import Task
 from transformers import AutoTokenizer
 import os
@@ -45,6 +45,10 @@ fix_recursive_import()
 # import torch
 # from pynvml.smi import nvidia_smi
 from pynvml import *
+
+from hivemind.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 def see_memory_usage(message, force=True):
 	logger = ''
@@ -323,18 +327,82 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             self.init_weight(j)
             
     def init_weight(self, j):
-        # print('self.llama_config ', self.llama_config)
-        expanded_path = os.path.abspath(os.path.expanduser(
-            os.path.join(self.path, f"{self.llama_config.name}-np")))
-        check_path = os.path.join(expanded_path, "embed_tokens.weight")
-        if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
-            download_llama_weights(self.llama_config.name, self.path)
-        self.layers[j].init_weight(self.weight_home[j], expanded_path)
+        logger.debug(f"Initializing weights for {self.__class__.__name__}")
         
-    
-    
-    
-    
+        embed_tokens_path = os.path.join(self.path, "model.embed_tokens.weight")
+        if not os.path.exists(embed_tokens_path) and DUMMY_WEIGHT not in embed_tokens_path:
+            logger.info(f"Downloading weights for {self.llama_config.name}")
+            download_llama_weights(self.llama_config.name, self.path)
+            
+        # Initialize ValueHolder for weight reuse if not already created
+        if not hasattr(self, '_weight_holder'):
+            from petals.flexgen_utils.utils import ValueHolder
+            self._weight_holder = ValueHolder()
+            logger.debug("Created new ValueHolder for weight reuse")
+        
+        from petals.models.llama.from_pretrained import load_and_reuse_weight_from_valh
+        
+        device = self.policy.device
+        dtype = self.policy.dtype
+        
+        if torch.cuda.is_available():
+            before_mem = torch.cuda.memory_allocated() / (1024 * 1024 * 1024) 
+            logger.info(f"GPU memory before loading weights: {before_mem:.2f} GB")
+        
+        for name, param in self.named_parameters():
+            if hasattr(param, 'data'):
+                param_path = os.path.join(self.path, f"model.{name}")
+                if DUMMY_WEIGHT in param_path:
+                    continue
+                is_meta_tensor = param.device.type == 'meta'
+                
+                try:
+                    # Try to load from ValueHolder first
+                    new_tensor = load_and_reuse_weight_from_valh(
+                        self._weight_holder,
+                        name,
+                        param.data,
+                        device_and_dtype=(device, dtype), 
+                        as_param=False
+                    )
+                    
+                    if new_tensor is not None:
+                        if is_meta_tensor:
+                            # For meta tensors, replace parameter entirely
+                            setattr(self, name.split('.')[-1], nn.Parameter(new_tensor))
+                            logger.debug(f"Replaced meta parameter {name} with real tensor")
+                        else:
+                            # For regular tensors, update in place
+                            param.data.copy_(new_tensor)
+                            logger.debug(f"Updated parameter {name} with loaded tensor")
+                            
+                except Exception as e:
+                    logger.error(f"Error handling {'meta ' if is_meta_tensor else ''}tensor {name}: {e}")
+                    try:
+                        loaded_tensor = load_and_reuse_weight_from_valh(
+                            self._weight_holder, 
+                            name, 
+                            param.data, 
+                            device_and_dtype=(device, dtype),
+                            as_param=False
+                        )
+                        
+                       
+                        if loaded_tensor is not None:
+                            # Use copy_ to avoid type mismatch issues
+                            param.data.copy_(loaded_tensor)
+                            logger.debug(f"Updated parameter {name} with loaded tensor")
+                    except Exception as e:
+                        logger.error(f"Error loading tensor for {name}: {e}")
+        
+        # Log memory usage after loading weights
+        if torch.cuda.is_available():
+            after_mem = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)  # Convert to GB
+            logger.info(f"GPU memory after loading weights: {after_mem:.2f} GB")
+            logger.info(f"Weight loading increased GPU memory by: {after_mem - before_mem:.2f} GB")
+            
+        return self
+
     def _optimized_input_layernorm(self, hidden_states):
         if self.pre_attn_graph is None:
             self.pre_attn_graph = make_inference_graphed_callable(

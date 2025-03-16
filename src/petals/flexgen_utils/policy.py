@@ -47,4 +47,20 @@ class Policy:
     @property
     def act_disk_percent(self):
         return 100 - self.act_gpu_percent - self.act_cpu_percent
+        
+    @property
+    def device(self):
+        """Return the device for weight loading."""
+        import torch
+        # If we're using GPU for weights, return cuda:0, otherwise cpu
+        if self.w_gpu_percent > 0:
+            return torch.device("cuda:0")
+        else:
+            return torch.device("cpu")
+            
+    @property
+    def dtype(self):
+        """Return the dtype for weight loading."""
+        import torch
+        return torch.float16  # Most models use float16
 

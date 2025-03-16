@@ -10,12 +10,15 @@ import json
 import time
 from contextlib import suppress
 from typing import Dict, Optional, Union
+# Memory monitoring imports
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
 import safetensors
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-# from accelerate.utils import set_module_tensor_to_device
 from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
@@ -36,7 +39,6 @@ from petals.flexgen_utils.policy import Policy
 from petals.flexgen_utils.pytorch_backend import fix_recursive_import, TorchTensor
 from petals.flexgen_utils.utils import ValueHolder, array_1d
 import numpy as np
-# import pdb
 
 
 
@@ -74,10 +76,18 @@ def load_pretrained_block(
     with init_empty_weights(): #init weights
         print('load_pretrained_block : init_empty_weights() ') 
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
-        # print('load pretrained block ', block)
-        # import pdb; pdb.set_trace()
-    # print('server from_pretrained.py:load_pretrained_block() after get_model_block  block', block)
-    #### currently, the block does not contain weights yet
+    
+    # Check if weights already loaded in weight_home
+    if block_index < len(weight_home) and weight_home[block_index] is not None and hasattr(weight_home[block_index], 'val'):
+        logger.info(f"Block {block_index} weights already loaded, reusing from weight_home")
+        if weight_home[block_index].val is not None:
+            for param_name, _ in block.named_parameters():
+                set_module_tensor_to_device(block, param_name, "cpu", value=weight_home[block_index].val)
+            return block
+        else:
+            logger.warning(f"ValueHolder for block {block_index} found but val is None, loading weights from scratch")
+    
+    # If weights not loaded yet, load them according to policy
     block_prefix = f"{config.block_prefix}.{block_index}." # block prefix is the transformer layer_idx
     state_dict = _load_state_dict_from_repo(
         model_name,
@@ -87,18 +97,66 @@ def load_pretrained_block(
         cache_dir=cache_dir,
         max_disk_space=max_disk_space,
     )
-    # state_dict contains weights tensors
-    # init_weight_list(state_dict, policy, env, block)
+    
+    # Initialize weights according to FlexGen policy
+    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
+    dev_choices = [env.disk, env.cpu, env.gpu]
+    
+    sizes = []
     for param_name, _ in block.named_parameters():
         assert param_name in state_dict, f"{param_name} not in state dict"
         param = state_dict[param_name]
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
+        cur_shape = np.array(param.size())
+        cur_size = np.prod(cur_shape)
+        sizes.append(cur_size)
+    
+    sizes_cumsum = np.cumsum(sizes)
+    i = 0
+    
+    collected_params = {}
+    
+    for param_name, _ in block.named_parameters():
+        assert param_name in state_dict, f"{param_name} not in state dict"
+        param = state_dict[param_name]
+        
+        # Determine device placement based on FlexGen policy
+        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
+        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
+        
+        shape = param.size()
+        dtype = param.dtype
+        
+        if len(shape) < 2:
+            pin_memory = True
+            compress = False
+        else:
+            pin_memory = policy.pin_weight
+            compress = policy.compress_weight
+
+        if not compress:
+            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
+            weight.load_from_state_dict(param)
+            collected_params[param_name] = weight
+        else:
+            weight = home.compressed_device.allocate(
+                shape, dtype, policy.comp_weight_config, pin_memory=pin_memory)
+            weight.load_from_state_dict(param)
+            collected_params[param_name] = weight
+            
+        # Set the parameter in the module
         set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
+        i += 1
+
+    # Store all collected parameters in the weight_home ValueHolder
+    if block_index < len(weight_home):
+        if weight_home[block_index] is None:
+            from petals.flexgen_utils.utils import ValueHolder
+            weight_home[block_index] = ValueHolder()
+        weight_home[block_index].store(collected_params)
+        logger.info(f"Successfully stored parameters for block {block_index} in weight_home")
 
     logger.info(f"Loaded {model_name} block {block_index}")
-    
-    return block # current block is WrappedLlamaBlock, and contains weights tensors
+    return block
 
 
 StateDict = Dict[str, torch.Tensor]

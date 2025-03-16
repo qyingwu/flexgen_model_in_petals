@@ -1,9 +1,33 @@
 from __future__ import annotations
+# Memory monitoring imports
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
+from mem_monitor import print_memory_usage
+
+# Define our own memory monitoring function to avoid external dependency
+def print_memory_usage(message=""):
+    """Simple memory usage display function"""
+    try:
+        import torch
+        import psutil
+        process = psutil.Process(os.getpid())
+        cpu_mem = process.memory_info().rss / (1024 * 1024 * 1024)  # Convert to GB
+        
+        print(f"\n-----------------------------------------{message} ")
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024 * 1024 * 1024)
+            max_allocated = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+            print(f" Nvidia-smi: {0.0:.1f} GB")  # Placeholder for nvidia-smi
+            print(f"    Memory Allocated: {allocated:.1f}  GigaBytes")
+            print(f"Max Memory Allocated: {max_allocated:.1f}  GigaBytes")
+    except Exception as e:
+        # If anything fails, just provide a minimal message
+        print(f"\n----- {message} -----")
 
 import gc
 import math
 import multiprocessing as mp
-import os
 import random
 import sys
 import threading
@@ -46,21 +70,6 @@ from petals.flexgen_utils.policy import Policy
 from petals.flexgen_utils.pytorch_backend import fix_recursive_import
 from petals.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
-
-def see_memory_usage(message, force=True):
-	logger = ''
-	logger += message
-	nvmlInit()
- 
-	# nvidia_smi.nvmlInit()
-	handle = nvmlDeviceGetHandleByIndex(0)
-	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
 
 logger = get_logger(__name__)
 
@@ -255,26 +264,86 @@ class Server:
         logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
 
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
-        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
-                    0, 100,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
-                    100, 0,             # act_gpu_percent: float, act_cpu_percent: float
-                    overlap=False, sep_layer=True, pin_weight=True,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=False,
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
+        # Configure FlexGen environment and policy for memory offloading
+        self.env = ExecutionEnv.create("~./flexgen_offload_dir")
+        
+        # MODIFIED: Force 100% GPU policy for memory testing
+        # Check if environment variable is set to force GPU-only mode
+        force_gpu_only = os.environ.get("FLEXGEN_DISABLE_CPU_OFFLOAD", "0") == "1"
+        force_gpu_percent = float(os.environ.get("FLEXGEN_FORCE_GPU_PERCENT", "0"))
+        
+        # Default distribution
+        w_gpu_percent = 100
+        w_cpu_percent = 0
+        
+        # If force GPU-only mode is enabled or explicit GPU percentage provided
+        if force_gpu_only:
+            w_gpu_percent = 100
+            w_cpu_percent = 0
+            logger.info("Forcing GPU-only mode: all weights on GPU")
+        elif force_gpu_percent > 0:
+            w_gpu_percent = min(100, force_gpu_percent)
+            w_cpu_percent = 100 - w_gpu_percent
+            logger.info(f"Forcing GPU percent to: {w_gpu_percent}%")
+        else:
+            # Calculate memory if not forced
+            if torch.cuda.is_available():
+                total_gpu_mem = torch.cuda.get_device_properties(self.device).total_memory
+                free_gpu_mem = torch.cuda.memory_allocated(self.device)
+                available_for_weights = (total_gpu_mem - free_gpu_mem) * 0.5
+                
+                try:
+                    # Use a simple estimate for weight size based on hidden size
+                    # Instead of calling get_block_size which requires env and policy
+                    weight_size_per_block = 2 * (self.block_config.hidden_size ** 2) * get_size_in_bytes(self.torch_dtype)
+                    total_weight_size = weight_size_per_block * num_blocks
+                    
+                    # Calculate percentage that can fit on GPU
+                    if total_weight_size > 0:
+                        potential_gpu_percent = min(100, (available_for_weights / total_weight_size) * 100)
+                        # Limit GPU usage to avoid high memory consumption unless forced
+                        w_gpu_percent = min(50, potential_gpu_percent)
+                        w_cpu_percent = 100 - w_gpu_percent
+                except Exception as e:
+                    logger.warning(f"Error calculating memory distribution: {e}. Using default values.")
+        
+        # Log the memory distribution strategy
+        logger.info(f"Weight distribution - GPU: {w_gpu_percent}%, CPU: {w_cpu_percent}%")
+        self.policy = Policy(
+            gpu_batch_size=1,
+            num_gpu_batches=1,
+            w_gpu_percent=w_gpu_percent,  # Dynamically determined based on available memory
+            w_cpu_percent=w_cpu_percent,
+            cache_gpu_percent=0,
+            cache_cpu_percent=100,
+            act_gpu_percent=100,  # Keep activations on GPU
+            act_cpu_percent=0,
+            overlap=False,
+            sep_layer=True,
+            pin_weight=True,
+            cpu_cache_compute=False,
+            attn_sparsity=1.0,
+            compress_weight=False,
+            comp_weight_config=CompressionConfig(
+                num_bits=4,
+                group_size=64,
+                group_dim=0,
+                symmetric=False
+            ),
+            compress_cache=False,
+            comp_cache_config=CompressionConfig(
+                num_bits=4,
+                group_size=64,
+                group_dim=2,
+                symmetric=False
+            )
+        )
+        # Initialize weight_home array based on actual number of blocks we'll serve
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = '/tmp/data/llama_weights'
         ##############################################################
         
-        see_memory_usage("-----------------------------------------in server: after policy  ")
+        print_memory_usage("-----------------------------------------in server: after policy  ")
         
         assert isinstance(throughput, float) or throughput in ["auto", "eval", "dry_run"]
         if throughput in ["auto", "eval", "dry_run"]:
@@ -300,7 +369,7 @@ class Server:
                 sys.exit(0)
         else:
             throughput_info = {"throughput": throughput}
-        see_memory_usage("-----------------------------------------in server: after throughput calculation  ")
+        print_memory_usage("-----------------------------------------in server: after throughput calculation  ")
         self.server_info = ServerInfo(
             state=ServerState.JOINING,
             public_name=public_name,
@@ -350,7 +419,11 @@ class Server:
         # Estimate of GPU memory used in rpc_backward (2 GiB for BLOOM, proportional for other models)
         autograd_memory = 2 * gib * num_devices / 14336 * self.block_config.hidden_size
 
-        block_size = get_block_size(self.block_config, "memory", dtype=self.torch_dtype, quant_type=self.quant_type)
+        # Using a simple size estimate rather than calling get_block_size which requires env and policy
+        bytes_per_value = get_size_in_bytes(self.torch_dtype)
+        # Roughly estimate number of parameters based on hidden size
+        params_per_block = 12 * self.block_config.hidden_size ** 2  # rough estimate for transformer block
+        block_size = int(params_per_block * bytes_per_value * 1.01)  # add 1% for metadata
         total_memory_per_block = block_size + self._cache_bytes_per_block
         if self.adapters:
             # Delay import of petals.utils.peft to avoid unnecessary import of bitsandbytes
@@ -545,7 +618,7 @@ class ModuleContainer(threading.Thread):
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
                 print('blocks uid before load_pretrained_block() ', module_uid )
-                see_memory_usage("-----------------------------------------before petals load pretrained block ")
+                print_memory_usage("-----------------------------------------before petals load pretrained block ")
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
@@ -560,7 +633,7 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------after petals load pretrained block ")
+                print_memory_usage("-----------------------------------------after petals load pretrained block ")
                 # print('block nn.module() before convert_block() ', block )
                 # print('block_config' , block_config)
                 block = convert_block(
@@ -576,7 +649,7 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                print_memory_usage("-----------------------------------------server: after convert_block  ")
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,  ###### block instance
