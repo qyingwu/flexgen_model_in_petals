@@ -55,11 +55,11 @@ def see_memory_usage(message, force=True):
 	# nvidia_smi.nvmlInit()
 	handle = nvmlDeviceGetHandleByIndex(0)
 	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
-	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+	logger += f"\nNvidia-smi: {(info.used) / 1024 / 1024 / 1024:.2f} GB"
+	logger += f"\nCUDA Allocated: {torch.cuda.memory_allocated() / (1024 * 1024 * 1024):.2f} GB"
+	logger += f"\nCUDA Max Allocated: {torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024):.2f} GB"
+	logger += f"\nCUDA Reserved: {torch.cuda.memory_reserved() / (1024 * 1024 * 1024):.2f} GB"
+	logger += f"\nCUDA Max Reserved: {torch.cuda.max_memory_reserved() / (1024 * 1024 * 1024):.2f} GB"
 	print(logger)
 
 logger = get_logger(__name__)
@@ -255,23 +255,58 @@ class Server:
         logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
 
         ##############################################################
-        self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
-        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
-                    0, 100,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
-                    100, 0,             # act_gpu_percent: float, act_cpu_percent: float
-                    overlap=False, sep_layer=True, pin_weight=True,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=False,
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
-        self.weight_home = array_1d(self.num_blocks, ValueHolder)
-        self.path = '/tmp/data/llama_weights'
+        self.env = ExecutionEnv.create("~/.flexgen_offload_dir")
+        
+        # Configure FlexGen policy based on device type
+        if device.type == "cuda":
+            # GPU-focused policy
+            self.policy = Policy(
+                gpu_batch_size=1, num_gpu_batches=1,
+                w_gpu_percent=100, w_cpu_percent=0,  # Store weights on GPU
+                cache_gpu_percent=100, cache_cpu_percent=0,  # Cache on GPU
+                act_gpu_percent=100, act_cpu_percent=0,  # Activations on GPU
+                overlap=True, sep_layer=True, pin_weight=True,
+                cpu_cache_compute=False, attn_sparsity=1.0,
+                compress_weight=False,
+                comp_weight_config=CompressionConfig(
+                    num_bits=4, group_size=64,
+                    group_dim=0, symmetric=False),
+                compress_cache=False,
+                comp_cache_config=CompressionConfig(
+                    num_bits=4, group_size=64,
+                    group_dim=2, symmetric=False)
+            )
+        else:
+            # CPU-focused policy
+            self.policy = Policy(
+                gpu_batch_size=1, num_gpu_batches=1,
+                w_gpu_percent=0, w_cpu_percent=100,  # Store weights on CPU
+                cache_gpu_percent=0, cache_cpu_percent=100,  # Cache on CPU
+                act_gpu_percent=0, act_cpu_percent=100,  # Activations on CPU
+                overlap=False, sep_layer=True, pin_weight=True,
+                cpu_cache_compute=True, attn_sparsity=1.0,
+                compress_weight=False,
+                comp_weight_config=CompressionConfig(
+                    num_bits=4, group_size=64,
+                    group_dim=0, symmetric=False),
+                compress_cache=False,
+                comp_cache_config=CompressionConfig(
+                    num_bits=4, group_size=64,
+                    group_dim=2, symmetric=False)
+            )
+
+        # Initialize weight_home for all blocks
+        if block_indices is not None:
+            try:
+                start_block, end_block = [int(index.strip()) for index in block_indices.split(":")]
+                max_block_index = end_block
+            except Exception as e:
+                raise ValueError(f"Failed to parse `--block_indices {block_indices}`, must be start:end (e.g. 0:18)")
+        else:
+            max_block_index = self.block_config.num_hidden_layers
+            
+        self.weight_home = array_1d(max_block_index, ValueHolder)
+        self.path = '/tmp/data/llama_weights'  # Configure this path as needed
         ##############################################################
         
         see_memory_usage("-----------------------------------------in server: after policy  ")
@@ -494,9 +529,9 @@ class ModuleContainer(threading.Thread):
         dht_prefix: str,
         converted_model_name_or_path: str,
         block_config: PretrainedConfig,
-        env: ExecutionEnv, ####
-        policy: Policy,    ####
-        weight_home: array_1d, ####
+        env: ExecutionEnv,
+        policy: Policy,
+        weight_home: array_1d,
         path: str,
         attn_cache_bytes: int,
         server_info: ServerInfo,
@@ -521,8 +556,11 @@ class ModuleContainer(threading.Thread):
         **kwargs,
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
-        print('module_uids ', module_uids)
+        logger.info(f"=== Starting ModuleContainer with blocks {block_indices} ===")
+        see_memory_usage("Initial memory state")
+        
         memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
+        logger.info(f"Initialized memory cache with {attn_cache_bytes / (1024**3):.2f} GB capacity")
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -537,22 +575,24 @@ class ModuleContainer(threading.Thread):
             daemon=True,
         )
         dht_announcer.start()
-        logger.info(f"Announced that blocks {block_indices} are joining")
+        logger.info(f"Announced blocks {block_indices} are joining")
 
         assert len(tensor_parallel_devices) >= 1 and all(isinstance(d, torch.device) for d in tensor_parallel_devices)
+        logger.info(f"Using tensor parallel devices: {tensor_parallel_devices}")
         
         blocks = {}
         try:
             for module_uid, block_index in zip(module_uids, block_indices):
-                print('blocks uid before load_pretrained_block() ', module_uid )
-                see_memory_usage("-----------------------------------------before petals load pretrained block ")
+                logger.info(f"\n=== Processing block {block_index} ===")
+                see_memory_usage(f"Before loading block {block_index}")
+                
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
-                    env, #######
-                    policy, #######
-                    weight_home, ######,
-                    path, ########
+                    env,
+                    policy,
+                    weight_home,
+                    path,
                     config=block_config,
                     torch_dtype=torch_dtype,
                     revision=revision,
@@ -560,11 +600,12 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------after petals load pretrained block ")
-                # print('block nn.module() before convert_block() ', block )
-                # print('block_config' , block_config)
+                
+                see_memory_usage(f"After loading block {block_index}")
+                logger.info(f"Converting block {block_index} for tensor parallel execution")
+                
                 block = convert_block(
-                    block,     ## block configuration
+                    block,
                     block_index,
                     block_config,
                     tensor_parallel_devices,
@@ -576,14 +617,18 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                see_memory_usage("-----------------------------------------sever: after convert_block  ")
+                
+                see_memory_usage(f"After converting block {block_index}")
+                logger.info(f"Creating TransformerBackend for block {block_index}")
+                
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
-                    block,  ###### block instance
+                    block,
                     config=block_config,
                     memory_cache=memory_cache,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
+                    weights_path=path,
                     args_schema=(
                         BatchTensorDescriptor(
                             1, 2048, block_config.hidden_size, dtype=torch_dtype, compression=compression
@@ -598,12 +643,18 @@ class ModuleContainer(threading.Thread):
                     min_batch_size=min_batch_size,
                     max_batch_size=max_batch_size,
                 )
+                see_memory_usage(f"After creating TransformerBackend for block {block_index}")
 
+            logger.info("Merging inference pools")
             merge_inference_pools_inplace(blocks)
+            see_memory_usage("After merging inference pools")
 
             if should_validate_reachability:
+                logger.info("Validating reachability")
                 validate_reachability(dht.peer_id)
-        except:
+            
+        except Exception as e:
+            logger.error(f"Error during block initialization: {str(e)}")
             logger.debug("Shutting down backends")
             for backend in blocks.values():
                 backend.shutdown()
@@ -612,6 +663,8 @@ class ModuleContainer(threading.Thread):
             logger.info(f"Announced that blocks {module_uids} are offline")
             raise
 
+        logger.info("=== ModuleContainer initialization completed successfully ===")
+        see_memory_usage("Final memory state")
         return cls(
             dht,
             dht_prefix,

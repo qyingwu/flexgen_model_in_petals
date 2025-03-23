@@ -10,6 +10,7 @@ import json
 import time
 from contextlib import suppress
 from typing import Dict, Optional, Union
+from pathlib import Path
 
 import safetensors
 import torch
@@ -48,57 +49,109 @@ logger = get_logger(__name__)
 
 def load_pretrained_block(
     model_name: str,
-    block_index: int,
+    block_idx: int,
     env: ExecutionEnv,
     policy: Policy,
     weight_home: array_1d,
     path: str,
     *,
-    config: Optional[PretrainedConfig] = None,
-    torch_dtype: Union[torch.dtype, str] = "auto",
-    revision: Optional[str] = None,
-    token: Optional[Union[str, bool]] = None,
+    config: PretrainedConfig,
+    revision: str,
     cache_dir: Optional[str] = None,
     max_disk_space: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    torch_dtype: Optional[torch.dtype] = None,
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+    use_safetensors: bool = True,
+    use_flash_attention_2: bool = False,
+    token: Optional[Union[str, bool]] = None,
 ) -> nn.Module:
-    if config is None:
-        config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
+    """Load a pretrained transformer block from Hugging Face Hub."""
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Cannot load model in both 8-bit and 4-bit")
+
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR
-    # print('server from_pretrained.py model_name ', model_name)
-    # print("server from_pretrained.py model config ", config)
-    
-    assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
-    torch_dtype = resolve_block_dtype(config, torch_dtype)
-    # import pdb; pdb.set_trace()
-    with init_empty_weights(): #init weights
-        print('load_pretrained_block : init_empty_weights() ') 
-        block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
-        # print('load pretrained block ', block)
-        # import pdb; pdb.set_trace()
-    # print('server from_pretrained.py:load_pretrained_block() after get_model_block  block', block)
-    #### currently, the block does not contain weights yet
-    block_prefix = f"{config.block_prefix}.{block_index}." # block prefix is the transformer layer_idx
-    state_dict = _load_state_dict_from_repo(
-        model_name,
-        block_prefix,
-        revision=revision,
-        token=token,
-        cache_dir=cache_dir,
-        max_disk_space=max_disk_space,
-    )
-    # state_dict contains weights tensors
-    # init_weight_list(state_dict, policy, env, block)
-    for param_name, _ in block.named_parameters():
-        assert param_name in state_dict, f"{param_name} not in state dict"
-        param = state_dict[param_name]
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
-        set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
 
-    logger.info(f"Loaded {model_name} block {block_index}")
-    
-    return block # current block is WrappedLlamaBlock, and contains weights tensors
+    if max_disk_space is not None:
+        try:
+            import psutil
+            import shutil
+
+            disk = shutil.disk_usage(cache_dir)
+            if disk.free < max_disk_space * 1024**3:
+                raise RuntimeError(
+                    f"Not enough disk space. Have {disk.free / 1024**3:.1f}GB, need {max_disk_space}GB"
+                )
+        except ImportError:
+            logger.warning("psutil not found, skipping disk space check")
+
+    if device is None:
+        device = torch.device("cpu")
+
+    if torch_dtype is None:
+        torch_dtype = torch.float32
+
+    # Load the block
+    block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_idx)
+    block = block.to(device=device, dtype=torch_dtype)
+
+    # Load the weights
+    try:
+        # Try to load from cache first
+        cache_path = Path(cache_dir) / "models--huggyllama--llama-7b" / "snapshots" / "4782ad278652c7c71b72204d462d6d01eaaf7549"
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Cache path not found: {cache_path}")
+
+        # Load weights from safetensors files
+        safetensors_paths = [
+            cache_path / "model-00001-of-00002.safetensors",
+            cache_path / "model-00002-of-00002.safetensors"
+        ]
+
+        # Load weights to CPU first, then move to target device
+        for safetensors_path in safetensors_paths:
+            if not safetensors_path.exists():
+                raise FileNotFoundError(f"Safetensors file not found: {safetensors_path}")
+
+            # Load weights to CPU first without device specification
+            state_dict = safetensors.torch.load_file(safetensors_path)
+            
+            # Filter weights for this block
+            block_state_dict = {}
+            for key, value in state_dict.items():
+                if f"model.layers.{block_idx}." in key:
+                    # Convert key to match block's state dict
+                    new_key = key.replace(f"model.layers.{block_idx}.", "")
+                    # Skip unexpected keys
+                    if new_key in block.state_dict().keys():
+                        # Move tensor to target device and dtype
+                        block_state_dict[new_key] = value.to(device=device, dtype=torch_dtype)
+            
+            # Load filtered weights into block
+            block.load_state_dict(block_state_dict, strict=False)
+            
+            # Clear memory after loading each file
+            del state_dict
+            del block_state_dict
+            torch.cuda.empty_cache()
+
+        # Convert to 8-bit or 4-bit if requested
+        if load_in_8bit:
+            block = block.quantize(load_in_8bit=True)
+        elif load_in_4bit:
+            block = block.quantize(load_in_4bit=True)
+
+        # Enable flash attention 2 if requested
+        if use_flash_attention_2:
+            block = block.enable_flash_attention_2()
+
+        return block
+
+    except Exception as e:
+        logger.error(f"Failed to load weights: {str(e)}")
+        raise
 
 
 StateDict = Dict[str, torch.Tensor]
