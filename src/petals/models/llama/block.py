@@ -442,8 +442,21 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         for j in range(self.num_layers):
             for name, param in self.layers[j].named_parameters():
                 if param.device.type != device.type:
-                    # Create temporary copy on target device
-                    param.data = self.weight_home[j].val.to(device)
+                    # Check if weight_home contains a list or a tensor
+                    if hasattr(self, 'weight_home') and j < len(self.weight_home):
+                        wh_val = self.weight_home[j].val
+                        if isinstance(wh_val, list):
+                            # Handle list case - FlexGen stores lists of tensors
+                            for tensor in wh_val:
+                                if hasattr(tensor, 'to') and tensor.shape == param.shape:
+                                    param.data = tensor.to(device)
+                                    break
+                        elif hasattr(wh_val, 'to'):  
+                            # Handle tensor case
+                            param.data = wh_val.to(device)
+                    else:
+                        # Fallback - just load from CPU if weight_home isn't available
+                        param.data = param.data.to(device)
         
         print(f"Loaded weights to {device}")
 
