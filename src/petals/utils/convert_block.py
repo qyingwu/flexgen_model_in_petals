@@ -64,25 +64,23 @@ def convert_block(
     :return: a module that acts like the original block, but runs with all specified optimizations
 
     """
-    if freeze:
+    see_memory_usage(f"=== Converting block {block_index} start ===")
+    
+    if kwargs.get('freeze', True):
         block.requires_grad_(False)
-    # print()
-    # import pdb; pdb.set_trace()
-    # print()
-    see_memory_usage("-----------------------------------------convert_block before make_tensor_parallel ")
+        see_memory_usage(f"=== After freezing block {block_index} ===")
+    
     block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
-    see_memory_usage("-----------------------------------------convert_block after make_tensor_parallel ")
+    see_memory_usage(f"=== After tensor parallelization of block {block_index} ===")
+    
+    quant_type = kwargs.get('quant_type', QuantType.NONE)
     if quant_type != QuantType.NONE:
         block = quantize_module(block, quant_type=quant_type)
-
-    # for shard, device in zip(block.module_shards, block.devices):
-    #     shard.to(device)
-    # for shard, device in zip(block.modules, block.devices):
-    #     shard.to(device)
-    print('quant_type ', quant_type)
-    print('adapters ', adapters )
-    if adapters:
-        
+        see_memory_usage(f"=== After quantization of block {block_index} ===")
+    
+    if kwargs.get('adapters'):
+        # Add adapter-related memory tracking
+        see_memory_usage(f"=== Before adding adapters to block {block_index} ===")
         from petals.utils.peft import add_adapter_to_block, create_lora_adapter, load_peft
 
         create_lora_adapter(block)
@@ -93,7 +91,8 @@ def convert_block(
                 **kwargs,
             )
             add_adapter_to_block(block, block_index, adapter_name, adapter_config, adapter_state_dict)
-
+        see_memory_usage(f"=== After adding adapters to block {block_index} ===")
+    
     return block
 
 

@@ -610,29 +610,42 @@ class FLEX_LlamaMLP(LlamaMLP):
 
     def forward(self, 
         hidden_states,
-        cache_read_buf,
-        weight_read_buf,
-        attention_mask,
-        cache_write_buf,
-        position_ids,
+        cache_read_buf=None,
+        weight_read_buf=None,
+        attention_mask=None,
+        cache_write_buf=None,
+        position_ids=None,
         k: int = 0
         ):
-        donate = [False] * 9
-        h, donate[0] = hidden_states.val, True
-        print('flex_llama.py MLP forward function  mlp h ,',  h)
-        if k == self.policy.num_gpu_batches - 1:
-            # Clear the weight_read_buf if it is the last gpu batch
-            ((gate, donate[1]), (down, donate[3]),
-             (up, donate[5]), (post_attention_layernorm, donate[7])) = weight_read_buf.pop()
+        # Check if we're using FlexGen optimization or standard HF path
+        if cache_read_buf is None or weight_read_buf is None:
+            # Standard HuggingFace forward path
+            # This is the path that will be used during normal inference
+            gate_output = self.gate_proj(hidden_states)
+            up_output = self.up_proj(hidden_states)
+            activated = gate_output * up_output
+            return self.down_proj(activated)
+        
         else:
-            ((gate, _), (down, _),
-             (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
+            # FlexGen optimized path with buffer arguments
+            # Original implementation
+            donate = [False] * 9
+            h, donate[0] = hidden_states.val, True
+            print('flex_llama.py MLP forward function  mlp h ,',  h)
+            
+            if k == self.policy.num_gpu_batches - 1:
+                # Clear the weight_read_buf if it is the last gpu batch
+                ((gate, donate[1]), (down, donate[3]),
+                 (up, donate[5]), (post_attention_layernorm, donate[7])) = weight_read_buf.pop()
+            else:
+                ((gate, _), (down, _),
+                 (up, _), (post_attention_layernorm, _)) = weight_read_buf.val
 
-        h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
-        hidden_states.val = h
-        print('flex_llama.py MLP forward function  h,',  h)
-        self.temp_hidden_states.val=h
-        return h
+            h = self.compute.mlp_llama(h, gate, down, up, donate, self.config, post_attention_layernorm)
+            hidden_states.val = h
+            print('flex_llama.py MLP forward function  h,',  h)
+            self.temp_hidden_states.val = h
+            return h
 
 
 
@@ -1329,6 +1342,20 @@ class LlamaLM:
     def __del__(self):
         self.delete_all_weights()
 
+    def _offload_weights_to_cpu(self):
+        """Move weights back to CPU after computation"""
+        for name, param in self.named_parameters():
+            if param.device.type == 'cuda':
+                # Store a CPU copy instead of using meta tensors
+                cpu_data = param.data.detach().cpu()
+                param.data = cpu_data
+        
+        # Force CUDA cache clearing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("Offloaded weights back to CPU safely")
+
 
 def get_filename(args):
     model_size = args.model.split('-')[-1]
@@ -1379,19 +1406,23 @@ def run_flexgen(args):
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    ## weight and cache compression
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+    policy = Policy(
+        gpu_batch_size=1,
+        num_gpu_batches=1,
+        w_gpu_percent=0,        # Keep weights on CPU
+        w_cpu_percent=100,      # 100% on CPU
+        cache_gpu_percent=100,
+        cache_cpu_percent=0,
+        act_gpu_percent=100,
+        act_cpu_percent=0,
+        overlap=False,
+        sep_layer=True,
+        pin_weight=True,
+        cpu_cache_compute=False,
+        attn_sparsity=1.0,
+        compress_weight=False,  # CHANGE THIS TO FALSE
+        compress_cache=False
+    )
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
     llama_config = get_llama_config(args.model)
     cache_size = llama_config.cache_bytes(num_prompts, prompt_len + gen_len)

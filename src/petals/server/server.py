@@ -8,7 +8,7 @@ import random
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union, Tuple
 
 import hivemind
 import psutil
@@ -46,6 +46,11 @@ from petals.flexgen_utils.policy import Policy
 from petals.flexgen_utils.pytorch_backend import fix_recursive_import
 from petals.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
+
+import flash_attn
+from accelerate import init_empty_weights
+
+from petals.models.llama.block import OptimizedLlamaDecoderLayer
 
 def see_memory_usage(message, force=True):
 	logger = ''
@@ -261,16 +266,26 @@ class Server:
         if device.type == "cuda":
             # GPU-focused policy
             self.policy = Policy(
-                gpu_batch_size=1, num_gpu_batches=1,
-                w_gpu_percent=100, w_cpu_percent=0,  # Store weights on GPU
-                cache_gpu_percent=100, cache_cpu_percent=0,  # Cache on GPU
-                act_gpu_percent=100, act_cpu_percent=0,  # Activations on GPU
-                overlap=True, sep_layer=True, pin_weight=True,
-                cpu_cache_compute=False, attn_sparsity=1.0,
+                gpu_batch_size=1,        # Add this as first argument
+                num_gpu_batches=1,       # Add this as second argument
+                w_gpu_percent=0,         # Now the keyword arguments
+                w_cpu_percent=100,
+                cache_gpu_percent=50,
+                cache_cpu_percent=50,
+                act_gpu_percent=0,
+                act_cpu_percent=100,
+                overlap=False,
+                sep_layer=True,
+                pin_weight=True,
+                cpu_cache_compute=True,
+                attn_sparsity=1.0,
                 compress_weight=False,
                 comp_weight_config=CompressionConfig(
-                    num_bits=4, group_size=64,
-                    group_dim=0, symmetric=False),
+                    num_bits=4,
+                    group_size=64,
+                    group_dim=0,
+                    symmetric=False
+                ),
                 compress_cache=False,
                 comp_cache_config=CompressionConfig(
                     num_bits=4, group_size=64,
@@ -279,20 +294,21 @@ class Server:
         else:
             # CPU-focused policy
             self.policy = Policy(
-                gpu_batch_size=1, num_gpu_batches=1,
-                w_gpu_percent=0, w_cpu_percent=100,  # Store weights on CPU
-                cache_gpu_percent=0, cache_cpu_percent=100,  # Cache on CPU
-                act_gpu_percent=0, act_cpu_percent=100,  # Activations on CPU
-                overlap=False, sep_layer=True, pin_weight=True,
-                cpu_cache_compute=True, attn_sparsity=1.0,
+                gpu_batch_size=1, 
+                num_gpu_batches=1,       # Add this as second argument
+                w_gpu_percent=0,         # Now the keyword arguments
+                w_cpu_percent=100,
+                cache_gpu_percent=100,
+                cache_cpu_percent=0,
+                act_gpu_percent=100,
+                act_cpu_percent=0,
+                overlap=False,
+                sep_layer=True,
+                pin_weight=True,
+                cpu_cache_compute=False,
+                attn_sparsity=1.0,
                 compress_weight=False,
-                comp_weight_config=CompressionConfig(
-                    num_bits=4, group_size=64,
-                    group_dim=0, symmetric=False),
-                compress_cache=False,
-                comp_cache_config=CompressionConfig(
-                    num_bits=4, group_size=64,
-                    group_dim=2, symmetric=False)
+                compress_cache=False
             )
 
         # Initialize weight_home for all blocks
@@ -586,6 +602,25 @@ class ModuleContainer(threading.Thread):
                 logger.info(f"\n=== Processing block {block_index} ===")
                 see_memory_usage(f"Before loading block {block_index}")
                 
+                # First initialize on meta device
+                model = OptimizedLlamaDecoderLayer(
+                    config=block_config,
+                    layer_id=block_index,
+                    env=env,
+                    policy=policy,
+                    weight_home=weight_home,
+                    path=path,
+                )
+                
+                # Then load needed weights only during forward pass
+                def forward(self, x):
+                    # Load only needed weights
+                    self._load_weights_to_device('cuda')
+                    output = compute_output(x)
+                    # Immediately offload
+                    self._offload_weights_to_cpu()
+                    return output
+                
                 block = load_pretrained_block(
                     converted_model_name_or_path,
                     block_index,
@@ -644,6 +679,10 @@ class ModuleContainer(threading.Thread):
                     max_batch_size=max_batch_size,
                 )
                 see_memory_usage(f"After creating TransformerBackend for block {block_index}")
+
+                # Add this after each block initialization
+                gc.collect()
+                torch.cuda.empty_cache()
 
             logger.info("Merging inference pools")
             merge_inference_pools_inplace(blocks)
@@ -895,3 +934,21 @@ class RuntimeWithDeduplicatedPools(Runtime):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pools = tuple(set(self.pools))
+
+    def _standard_forward(self, hidden_states, attention_mask=None, position_ids=None, 
+                         past_key_value=None, output_attentions=False, use_cache=False,
+                         cache_position=None):
+        # Regular implementation of LlamaAttention forward method
+        # Copy the original implementation from LlamaAttention
+        # This is the path that will be used by the server
+        ...
+        return hidden_states, None, past_key_value
+
+def offload_layer_completely(layer):
+    for name, param in layer.named_parameters():
+        # Copy to CPU
+        cpu_data = param.data.detach().cpu()
+        # Store CPU copy
+        param.data = cpu_data
+        # Force CUDA cache clearing
+        torch.cuda.empty_cache()
